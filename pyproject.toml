@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thinkingbox-training"
+version = "0.1.0"
+description = "Fine-tuning / RL training scripts built on top of the thinkingbox framework"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Framework (editable, sibling checkout)
+    "thinkingbox",
+    # Core training stack
+    "torch>=2.4",
+    "transformers>=4.45",
+    "trl>=0.11",
+    "accelerate>=0.34",
+    "peft>=0.13",
+    "datasets>=3.0",
+    "tokenizers>=0.20",
+    "sentencepiece",
+    "safetensors",
+    "einops",
+    # Experiment tracking / utilities
+    "wandb",
+    "tensorboard",
+    "tqdm",
+    "rich",
+    "pyyaml",
+    "verl>=0.4.1",
+    "vllm>=0.21.0",
+]
+
+[project.optional-dependencies]
+# Install separately after the base env is built; these wheels are picky.
+fast = [
+    "flash-attn>=2.6",
+]
+serve = [
+    "vllm>=0.6",
+]
+quant = [
+    "bitsandbytes>=0.44",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    "black",
+]
+
+[tool.uv.sources]
+# Use the sibling thinkingbox checkout as an editable install.
+thinkingbox = { path = "../thinkingbox", editable = true }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["thinkingbox_training*"]
