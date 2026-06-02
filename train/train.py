@@ -393,12 +393,12 @@ def run_one_step(
             flat.append(r)
             group_ids.append(gid)
     n_sys_errors = sum(r.is_system_error for r in flat)
-    if not flat:
-        logger.warning("step %d: no rollouts; skipping", step)
-        return current_lora_name, None
+    # NOTE: do not early-return when `flat` is empty. The global skip vote
+    # below (`local_ok` all_reduce) is the only safe way to bail; a local
+    # return here causes the other ranks to deadlock in NCCL.
 
     # ----- Reward -----
-    rewards = score_rollouts(flat, name=cfg.reward_fn)
+    rewards = score_rollouts(flat, name=cfg.reward_fn) if flat else []
 
     # ----- Tokenize (skip rollouts whose chat-template render fails, e.g. system errors) -----
     tokenized: list = []
@@ -432,8 +432,8 @@ def run_one_step(
     else:
         global_ok = local_ok
     if not global_ok:
-        logger.warning("step %d: no usable rollouts on at least one rank (local_ok=%d, sys_errors=%d); skipping",
-                       step, local_ok, n_sys_errors)
+        logger.warning("step %d: no usable rollouts on at least one rank (local_n_rollouts=%d, local_ok=%d, sys_errors=%d); skipping",
+                       step, len(flat), local_ok, n_sys_errors)
         return current_lora_name, None
     if len(keep) < len(tokenized):
         logger.info("step %d: dropping %d empty-mask rollouts", step, len(tokenized) - len(keep))
