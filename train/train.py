@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import datetime
 import json
 import logging
 import os
@@ -79,7 +80,13 @@ def setup_ddp() -> tuple[int, int, int]:
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
         if world_size > 1 and not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
+            # Default NCCL watchdog is 10 min; rollouts can occasionally take
+            # longer when one rank's prompts hit slow vLLM generations. Give
+            # collectives 30 min of slack so a slow rank doesn't crash the run.
+            dist.init_process_group(
+                backend="nccl",
+                timeout=datetime.timedelta(minutes=30),
+            )
         return rank, world_size, local_rank
     return 0, 1, 0
 
@@ -130,6 +137,7 @@ class TrainConfig:
     ppo_epochs: int = 1
     micro_batch_size: int = 1           # process this many rollouts at a time
     max_seq_len: int = 12288            # truncate left if a rollout exceeds this
+    rollout_timeout_s: float = 1200.0   # wall-clock cap for the rollout phase per step (per rank)
 
     # RL loss
     rl_loss: RLLossConfig = field(default_factory=RLLossConfig)
@@ -328,6 +336,71 @@ def build_runner(tb_cfg: ConfigFile, lora_name: str, concurrency: int) -> Rollou
     new_cfg.orchestrator.agent_model.deployment = lora_name
     return RolloutRunner(config=new_cfg, concurrency=concurrency, dump_raw=False)
 
+
+def _sys_error_rollout(uid: str, sample_idx: int, reason: str) -> Rollout:
+    """Synthesize a system-error Rollout stub for a task that didn't complete."""
+    return Rollout(
+        uid=uid,
+        sample_idx=sample_idx,
+        reward=0.0,
+        is_correct=False,
+        is_system_error=True,
+        finish_reason=reason,
+        messages=[],
+        raw_messages=None,
+        metadata={"rollout_timeout": True, "reason": reason},
+    )
+
+
+def bounded_rollout_many(
+    runner: RolloutRunner,
+    tcs: list,
+    n_samples: int,
+    timeout_s: float,
+) -> tuple[dict[str, list[Rollout]], int]:
+    """Run rollouts with a wall-clock budget; cancel + stub out the rest.
+
+    Returns ({uid: [Rollout,...]}, n_unfinished). `n_unfinished` counts how
+    many of the per-sample tasks were cancelled because the budget expired.
+    The returned dict always contains every (uid, sample_idx) slot, with
+    cancelled slots populated by `is_system_error=True` placeholders so the
+    downstream filtering logic skips them naturally.
+    """
+    async def _run() -> tuple[dict[str, list[Rollout]], int]:
+        # Build (uid, sample_idx, task) triples so we can stub cancelled ones.
+        triples = [
+            (tc.uid, i, asyncio.create_task(runner._one(tc, i)))
+            for tc in tcs for i in range(n_samples)
+        ]
+        if not triples:
+            return {}, 0
+        tasks = [t for _, _, t in triples]
+        done, pending = await asyncio.wait(tasks, timeout=timeout_s)
+        for t in pending:
+            t.cancel()
+        # Drain cancellations so they don't show up as un-awaited warnings.
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        out: dict[str, list[Rollout]] = {}
+        n_unfinished = 0
+        for uid, idx, t in triples:
+            if t in done and not t.cancelled():
+                exc = t.exception()
+                if exc is None:
+                    r = t.result()
+                else:
+                    r = _sys_error_rollout(uid, idx, f"exception: {type(exc).__name__}")
+                    n_unfinished += 1
+            else:
+                r = _sys_error_rollout(uid, idx, "timeout")
+                n_unfinished += 1
+            out.setdefault(uid, []).append(r)
+        for uid in out:
+            out[uid].sort(key=lambda r: r.sample_idx)
+        return out, n_unfinished
+
+    return asyncio.run(_run())
+
 def run_one_step(
     step: int,
     cfg: TrainConfig,
@@ -361,12 +434,22 @@ def run_one_step(
     batch_tcs = [by_name[n] for n in local_pick]
 
     # ----- Rollout (this rank's slice only) -----
+    # Wall-clock-bounded so a slow vLLM generation on this rank can never hold
+    # the whole DDP group hostage. Unfinished rollouts are returned as
+    # system-error stubs and filtered downstream by the existing logic.
     runner = build_runner(tb_cfg, current_lora_name, cfg.rollout_concurrency)
     t0 = time.monotonic()
-    rollouts_by_uid = asyncio.run(
-        runner.rollout_many(batch_tcs, n_samples=cfg.n_samples_per_prompt)
+    rollouts_by_uid, n_timed_out = bounded_rollout_many(
+        runner, batch_tcs,
+        n_samples=cfg.n_samples_per_prompt,
+        timeout_s=cfg.rollout_timeout_s,
     )
     t_rollout = time.monotonic() - t0
+    if n_timed_out and is_rank0(rank):
+        logger.warning(
+            "step %d: rollout phase exceeded %.0fs budget on rank %d; %d task(s) cancelled and marked as system errors",
+            step, cfg.rollout_timeout_s, rank, n_timed_out,
+        )
     flat: list[Rollout] = []
     group_ids: list[int] = []
     for gid, uid in enumerate(sorted(rollouts_by_uid)):
@@ -537,6 +620,9 @@ def main():
                     help="Pass find_unused_parameters=True to DDP (slower; use only if needed).")
     ap.add_argument("--max-seq-len", type=int, default=16384,
                     help="Truncate left if a rollout exceeds this token count.")
+    ap.add_argument("--rollout-timeout", type=float, default=1200.0,
+                    help="Wall-clock cap (seconds) for the rollout phase per step on each rank. "
+                         "Unfinished rollouts are cancelled and treated as system errors.")
     ap.add_argument("--eval-every", type=int, default=0,
                     help="Run eval every N training steps (0 disables periodic eval).")
     ap.add_argument("--eval-at-start", action="store_true",
@@ -602,6 +688,7 @@ def main():
         log_file=args.log_file,
         seed=args.seed,
         max_seq_len=args.max_seq_len,
+        rollout_timeout_s=args.rollout_timeout,
         state_save_dir=args.state_save_dir,
     )
     # ----- DDP setup (no-op if not launched via torchrun) -----
