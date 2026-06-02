@@ -30,9 +30,54 @@ def load_tokenizer(model_name_or_path: str) -> PreTrainedTokenizerBase:
     return AutoTokenizer.from_pretrained(model_name_or_path)
 
 
+def _tb_to_openai(messages: list[dict]) -> list[dict]:
+    """Convert thinkingbox Message dicts (Text/ToolCall/ParallelToolCall/ToolResponse,
+    discriminated by `T`) to OpenAI-format chat messages. Pass-through if `T` absent.
+    """
+    import json as _json
+
+    out: list[dict] = []
+    for m in messages:
+        t = m.get("T")
+        if t in (None, "Message"):
+            out.append(m)
+            continue
+        if t == "Text":
+            out.append({"role": m["role"], "content": m.get("content", "")})
+        elif t == "ToolCall":
+            out.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": m.get("id", ""),
+                    "type": "function",
+                    "function": {"name": m["name"], "arguments": _json.dumps(m.get("arguments") or {})},
+                }],
+            })
+        elif t == "ParallelToolCall":
+            tcs = []
+            for tc in m.get("tool_calls", []):
+                tcs.append({
+                    "id": tc.get("id", ""),
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": _json.dumps(tc.get("arguments") or {})},
+                })
+            out.append({"role": "assistant", "content": "", "tool_calls": tcs})
+        elif t == "ToolResponse":
+            out.append({
+                "role": "tool",
+                "tool_call_id": m.get("id", ""),
+                "content": m.get("content", ""),
+            })
+        else:
+            out.append(m)
+    return out
+
+
 def normalize_messages(messages: list[dict]) -> list[dict]:
     """Adapt OpenAI-style messages to what Qwen3's chat template accepts.
 
+    - Convert thinkingbox-format Message dicts (T=Text|ToolCall|...) → OpenAI.
     - Merge consecutive system messages (template forbids two in a row).
     - Drop None-valued OpenAI extras (refusal, audio, function_call, annotations).
     - Coerce assistant content=None → "".
@@ -41,6 +86,7 @@ def normalize_messages(messages: list[dict]) -> list[dict]:
     """
     import json as _json
 
+    messages = _tb_to_openai(messages)
     out: list[dict] = []
     for m in messages:
         m = {k: v for k, v in m.items() if v is not None}

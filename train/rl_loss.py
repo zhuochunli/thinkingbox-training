@@ -120,6 +120,7 @@ def compute_rl_loss(
     rewards: torch.Tensor,           # [B]
     group_ids: torch.Tensor,         # [B] int
     cfg: RLLossConfig,
+    advantages: Optional[torch.Tensor] = None,  # [B] precomputed (full-batch); overrides reward-based recomputation
 ) -> dict:
     B, T, V = logits.shape
     assert input_ids.shape == (B, T)
@@ -140,7 +141,8 @@ def compute_rl_loss(
     ratio = torch.exp(logr.clamp(max=float(torch.log(torch.tensor(cfg.max_ratio)))))
 
     # Advantages: per-rollout scalar, broadcast to tokens
-    advantages = compute_advantages(rewards, group_ids, cfg)  # [B]
+    if advantages is None:
+        advantages = compute_advantages(rewards, group_ids, cfg)  # [B]
     adv_t = advantages.unsqueeze(1).expand_as(ratio)          # [B, T-1]
 
     # PPO clipped objective (per token)

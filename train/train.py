@@ -151,7 +151,7 @@ class TrainConfig:
     lora_name_template: str = "policy_step_{step:05d}"
 
     # I/O
-    log_file: str = "checkpoints/train_log.jsonl"
+    log_file: str | None = None  # set to a path to also write per-step metrics as JSONL; defaults off (wandb is the source of truth)
     seed: int = 0
 
     # === STEP G integration (reconstructed) ===
@@ -269,38 +269,63 @@ def policy_forward_with_grad(
 
     is_ddp = isinstance(model, torch.nn.parallel.DistributedDataParallel)
     micro_starts = list(range(0, B, micro_batch_size))
-    last_idx = len(micro_starts) - 1
+    local_n = len(micro_starts)
 
-    for i, s in enumerate(micro_starts):
-        e = min(s + micro_batch_size, B)
-        ids = batch.input_ids[s:e]
-        attn = batch.attention_mask[s:e]
-        amask = batch.assistant_mask[s:e]
+    # DDP requires every rank to do the same number of .backward() calls so the
+    # NCCL all-reduce schedule stays in lockstep. After per-rank rollout filtering,
+    # B (and hence local_n) can differ across ranks. Synchronise to the global max
+    # and pad with zero-weighted no-op micro-batches on shorter ranks.
+    if is_ddp and dist.is_available() and dist.is_initialized():
+        n_t = torch.tensor(local_n, device=batch.input_ids.device, dtype=torch.long)
+        dist.all_reduce(n_t, op=dist.ReduceOp.MAX)
+        global_n = int(n_t.item())
+    else:
+        global_n = local_n
+    last_idx = global_n - 1
 
-        logits = model(input_ids=ids, attention_mask=attn, use_cache=False).logits.float()
+    for i in range(global_n):
+        if i < local_n:
+            s = micro_starts[i]
+            e = min(s + micro_batch_size, B)
+            ids = batch.input_ids[s:e]
+            attn = batch.attention_mask[s:e]
+            amask = batch.assistant_mask[s:e]
+            logits = model(input_ids=ids, attention_mask=attn, use_cache=False).logits.float()
+            out = compute_rl_loss(
+                logits=logits,
+                input_ids=ids,
+                assistant_mask=amask,
+                old_logprobs=old_logprobs[s:e],
+                ref_logprobs=ref_logprobs[s:e] if ref_logprobs is not None else None,
+                rewards=batch.rewards[s:e],
+                group_ids=batch.group_ids[s:e],
+                advantages=advantages_full[s:e],
+                cfg=cfg,
+            )
+            sub_tokens = amask[:, 1:].sum().clamp_min(1).item()
+            w = sub_tokens / total_tokens
+            loss = out["loss"] * w
+        else:
+            # Pad: re-run the rank's first micro-batch with weight 0 so the
+            # graph is non-empty and DDP can still all-reduce on schedule.
+            s = micro_starts[0]
+            e = min(s + micro_batch_size, B)
+            ids = batch.input_ids[s:e]
+            attn = batch.attention_mask[s:e]
+            amask = batch.assistant_mask[s:e]
+            logits = model(input_ids=ids, attention_mask=attn, use_cache=False).logits.float()
+            loss = logits.sum() * 0.0
+            out = None
+            w = 0.0
 
-        out = compute_rl_loss(
-            logits=logits,
-            input_ids=ids,
-            assistant_mask=amask,
-            old_logprobs=old_logprobs[s:e],
-            ref_logprobs=ref_logprobs[s:e] if ref_logprobs is not None else None,
-            rewards=batch.rewards[s:e],
-            group_ids=batch.group_ids[s:e],
-            advantages=advantages_full[s:e],  # injected so micro-batching is correct
-            cfg=cfg,
-        )
-        # Re-weight so the effective batch-level loss == token_mean over full batch
-        sub_tokens = amask[:, 1:].sum().clamp_min(1).item()
-        w = sub_tokens / total_tokens
-        # Skip DDP grad sync on all but the last micro-batch (one all-reduce per step).
         sync_ctx = model.no_sync() if (is_ddp and i < last_idx) else nullcontext()
         with sync_ctx:
-            (out["loss"] * w).backward()
-        for k, v in out.items():
-            if torch.is_tensor(v):
-                diag_sum[k] += float(v.detach()) * w
-        diag_w += w
+            loss.backward()
+        if out is not None:
+            for k, v in out.items():
+                if torch.is_tensor(v):
+                    diag_sum[k] += float(v.detach()) * w
+            diag_w += w
 
     return {k: v / max(diag_w, 1e-12) for k, v in diag_sum.items()}
 
@@ -385,18 +410,30 @@ def run_one_step(
             tokenized.append(render_with_assistant_mask(r.messages, tokenizer))
             render_keep.append(i)
         except Exception as e:
-            roles = [getattr(m, "role", "?") for m in r.messages]
+            roles = [
+                (m.get("role") if isinstance(m, dict) else getattr(m, "role", "?"))
+                for m in r.messages
+            ]
             logger.warning("step %d: render failed for rollout %d (%s: %s); roles=%s",
-                           step, i, type(e).__name__, str(e)[:160], roles)
+                           step, i, type(e).__name__, str(e)[:200], roles)
     flat = [flat[i] for i in render_keep]
     rewards = [rewards[i] for i in render_keep]
     group_ids = [group_ids[i] for i in render_keep]
 
     # Skip degenerate rollouts (no assistant tokens to train on)
     keep = [i for i, tr in enumerate(tokenized) if any(tr.assistant_mask)]
-    if not keep:
-        logger.warning("step %d: no usable rollouts (sys_errors=%d); skipping",
-                       step, n_sys_errors)
+    # Global skip vote: if ANY rank has zero usable rollouts, all ranks must
+    # skip together — otherwise the surviving ranks deadlock in NCCL.
+    local_ok = 1 if keep else 0
+    if world_size > 1 and dist.is_available() and dist.is_initialized():
+        ok_t = torch.tensor(local_ok, device=torch.device(cfg.device), dtype=torch.long)
+        dist.all_reduce(ok_t, op=dist.ReduceOp.MIN)
+        global_ok = int(ok_t.item())
+    else:
+        global_ok = local_ok
+    if not global_ok:
+        logger.warning("step %d: no usable rollouts on at least one rank (local_ok=%d, sys_errors=%d); skipping",
+                       step, local_ok, n_sys_errors)
         return current_lora_name, None
     if len(keep) < len(tokenized):
         logger.info("step %d: dropping %d empty-mask rollouts", step, len(tokenized) - len(keep))
@@ -513,7 +550,8 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--algo", choices=["grpo", "dr_grpo", "dapo"], default="dr_grpo")
     ap.add_argument("--lora-save-dir", default="checkpoints/lora")
-    ap.add_argument("--log-file", default="checkpoints/train_log.jsonl")
+    ap.add_argument("--log-file", default=None,
+                    help="optional path to a per-step metrics JSONL; if omitted, no JSONL is written")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ddp-find-unused-parameters", action="store_true",
                     help="Pass find_unused_parameters=True to DDP (slower; use only if needed).")
@@ -546,6 +584,11 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # Silence chatty third-party loggers so the training log stays readable.
+    for _name in ("httpx", "httpcore", "urllib3", "openai", "anthropic",
+                  "azure", "azure.identity", "azure.core", "msal",
+                  "filelock", "transformers"):
+        logging.getLogger(_name).setLevel(logging.WARNING)
 
     # ----- RL loss config from --algo -----
     if args.algo == "grpo":
@@ -718,12 +761,14 @@ def main():
     # === END STEP G ===
 
     # ----- Train -----
-    if is_rank0(rank):
+    if is_rank0(rank) and cfg.log_file:
         Path(cfg.log_file).parent.mkdir(parents=True, exist_ok=True)
     ddp_barrier(world_size)
 
     log_fh_cm = (
-        open(cfg.log_file, "a", encoding="utf-8") if is_rank0(rank) else nullcontext()
+        open(cfg.log_file, "a", encoding="utf-8")
+        if (is_rank0(rank) and cfg.log_file)
+        else nullcontext()
     )
     try:
         with log_fh_cm as log_fh:

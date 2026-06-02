@@ -9,3 +9,8 @@ dist/
 .ruff_cache/
 .mypy_cache/
 uv.lock
+
+# Training artifacts (never commit)
+checkpoints/
+logs/
+wandb/
