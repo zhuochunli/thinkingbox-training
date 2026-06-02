@@ -1,7 +1,3 @@
-# RECONSTRUCTED FROM CACHE — verify against memory.
-# Source: transcript 970dfb5c lines 14293-14443 (initial create) with the
-# replacement at lines 14478-14484 applied (synthetic grads instead of
-# forward pass, because PEFT wrapping injects an input_ids kwarg).
 """Standalone unit test for train.checkpoint — no vLLM / MCP / Qwen needed.
 
 Uses a tiny synthetic model + LoRA to validate that save_train_state /

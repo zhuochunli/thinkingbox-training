@@ -1,5 +1,3 @@
-# RECONSTRUCTED FROM CACHE — verify against memory.
-# Source: transcript 970dfb5c lines 4558-4621 (verbatim assistant-authored content).
 """Load test-case lists, do seeded train/eval split, hydrate cases."""
 
 from __future__ import annotations

@@ -1,5 +1,3 @@
-# RECONSTRUCTED FROM CACHE — verify against memory.
-# Source: transcript 970dfb5c lines 4624-4729 (verbatim assistant-authored content).
 """Async rollout runner: produces `G` trajectories per prompt for GRPO.
 
 Reuses `thinkingbox.cli.infer.TBWorker` so the rollout matches what `tb infer`

@@ -1,6 +1,4 @@
 #!/bin/bash
-# RECONSTRUCTED FROM CACHE — verify against memory.
-# Source: transcript 970dfb5c lines 3287-3370 (verbatim assistant-authored content).
 # End-to-end smoke test: run `tb infer` on the 5 seeded eval cases
 # (same seed=42 that training will use for its held-out split).
 # Verifies: MCP proxy + typesense + vLLM + agent + judge all wired up correctly.

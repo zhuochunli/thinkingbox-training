@@ -1,5 +1,3 @@
-# RECONSTRUCTED FROM CACHE — verify against memory.
-# Source: transcript 970dfb5c lines 4732-4842 (verbatim assistant-authored content).
 """Smoke-test the rollout runner: G rollouts per prompt × N prompts → JSONL.
 
 Usage:

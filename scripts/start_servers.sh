@@ -1,6 +1,4 @@
 #!/bin/bash
-# RECONSTRUCTED FROM CACHE — verify against memory.
-# Source: transcript 970dfb5c lines 3196-3234 (verbatim assistant-authored content).
 # Start MCP proxy (port 7111) + typesense-server for training rollouts.
 # Uses the PRIVATE servers.yaml (AI.ThinkingBox.Data) because both
 # train_list_origin and train_list_in_scenario depend on private tools.

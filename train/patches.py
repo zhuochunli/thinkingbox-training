@@ -1,5 +1,3 @@
-# RECONSTRUCTED FROM CACHE — verify against memory.
-# Source: transcript 970dfb5c lines 10030-10098 (verbatim assistant-authored content).
 """Monkey-patches applied before importing thinkingbox runners.
 
 Qwen3.5's chat template enforces a single system message at index 0 and raises

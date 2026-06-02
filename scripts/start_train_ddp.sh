@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# RECONSTRUCTED FROM CACHE — verify against memory.
-# Source: transcript 970dfb5c lines 13345-13375 (verbatim assistant-authored content).
 # Launch DDP training across GPUs 0-5 (vLLM owns GPUs 6,7).
 # Usage:
 #   scripts/start_train_ddp.sh [extra train.py args]

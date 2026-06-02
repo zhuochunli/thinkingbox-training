@@ -1,5 +1,3 @@
-# RECONSTRUCTED FROM CACHE — verify against memory.
-# Source: transcript 970dfb5c lines 7394-7436 (verbatim assistant-authored content).
 """Reward functions for RL training.
 
 Each reward function takes a `Rollout` (see train.rollout) and returns a scalar.

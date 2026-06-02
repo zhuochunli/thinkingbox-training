@@ -1,5 +1,3 @@
-# RECONSTRUCTED FROM CACHE — verify against memory.
-# Source: transcript 970dfb5c lines 5820-5914 (verbatim assistant-authored content).
 """Round-trip check: tokenize a rollout, decode the masked spans, compare to
 the original assistant content. Run after demo_rollout.py.
 

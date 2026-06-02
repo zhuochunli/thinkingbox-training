@@ -1,5 +1,3 @@
-# RECONSTRUCTED FROM CACHE — verify against memory.
-# Source: transcript 970dfb5c lines 13493-13583 (verbatim assistant-authored content).
 """Lightweight periodic eval for thinkingbox-training.
 
 One sample per case (no grouping), runs the configured rollout + reward path,

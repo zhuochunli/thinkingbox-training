@@ -54,7 +54,6 @@ from train.tokenize_chat import (
     TokenizedRollout,
     render_with_assistant_mask,
 )
-# === STEP G integration (reconstructed) ===
 from train import patches
 from train.checkpoint import (
     load_train_state,
@@ -66,10 +65,7 @@ from train.checkpoint import (
 )
 from train.eval_loop import log_eval, run_eval
 from train.wandb_logger import WandbLogger
-# === END STEP G ===
-
 logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # DDP helpers (no-op when launched without torchrun)
@@ -87,25 +83,20 @@ def setup_ddp() -> tuple[int, int, int]:
         return rank, world_size, local_rank
     return 0, 1, 0
 
-
 def cleanup_ddp(world_size: int) -> None:
     if world_size > 1 and dist.is_initialized():
         dist.destroy_process_group()
 
-
 def is_rank0(rank: int) -> bool:
     return rank == 0
-
 
 def ddp_barrier(world_size: int) -> None:
     if world_size > 1 and dist.is_initialized():
         dist.barrier()
 
-
 def peft_of(policy):
     """Return the underlying PeftModel whether or not `policy` is a DDP wrapper."""
     return policy.module if isinstance(policy, torch.nn.parallel.DistributedDataParallel) else policy
-
 
 # ---------------------------------------------------------------------------
 # Config
@@ -154,11 +145,7 @@ class TrainConfig:
     log_file: str | None = None  # set to a path to also write per-step metrics as JSONL; defaults off (wandb is the source of truth)
     seed: int = 0
 
-    # === STEP G integration (reconstructed) ===
     state_save_dir: str = "checkpoints/state"
-    # === END STEP G ===
-
-
 # ---------------------------------------------------------------------------
 # Batching
 # ---------------------------------------------------------------------------
@@ -170,7 +157,6 @@ class Batch:
     rewards: torch.Tensor            # [B]
     group_ids: torch.Tensor          # [B]
     seq_lens: torch.Tensor           # [B] real token counts
-
 
 def collate(
     tokenized: list[TokenizedRollout],
@@ -212,7 +198,6 @@ def collate(
         seq_lens=torch.tensor(lens, dtype=torch.long, device=device),
     )
 
-
 # ---------------------------------------------------------------------------
 # Per-batch logprob computation (memory-friendly via micro-batches)
 # ---------------------------------------------------------------------------
@@ -239,7 +224,6 @@ def compute_logprobs(
         shift_targets = ids[:, 1:]
         out[s:e] = gather_token_logprobs(shift_logits, shift_targets)
     return out
-
 
 def policy_forward_with_grad(
     model,
@@ -329,7 +313,6 @@ def policy_forward_with_grad(
 
     return {k: v / max(diag_w, 1e-12) for k, v in diag_sum.items()}
 
-
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -339,13 +322,11 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-
 def build_runner(tb_cfg: ConfigFile, lora_name: str, concurrency: int) -> RolloutRunner:
     # Mutate the deployment so vLLM dispatches to our LoRA
     new_cfg = tb_cfg.model_copy(deep=True)
     new_cfg.orchestrator.agent_model.deployment = lora_name
     return RolloutRunner(config=new_cfg, concurrency=concurrency, dump_raw=False)
-
 
 def run_one_step(
     step: int,
@@ -523,7 +504,6 @@ def run_one_step(
 
     return next_name, log_row
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tb-config", default="config_training.yaml")
@@ -555,7 +535,6 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--ddp-find-unused-parameters", action="store_true",
                     help="Pass find_unused_parameters=True to DDP (slower; use only if needed).")
-    # === STEP G integration (reconstructed) ===
     ap.add_argument("--max-seq-len", type=int, default=16384,
                     help="Truncate left if a rollout exceeds this token count.")
     ap.add_argument("--eval-every", type=int, default=0,
@@ -576,7 +555,6 @@ def main():
     ap.add_argument("--wandb-entity", default="zhuochun-university-of-pittsburgh")
     ap.add_argument("--weave", action="store_true",
                     help="Enable weave tracing (uses --wandb-project / --wandb-entity).")
-    # === END STEP G ===
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -623,10 +601,8 @@ def main():
         lora_save_dir=args.lora_save_dir,
         log_file=args.log_file,
         seed=args.seed,
-        # === STEP G integration (reconstructed) ===
         max_seq_len=args.max_seq_len,
         state_save_dir=args.state_save_dir,
-        # === END STEP G ===
     )
     # ----- DDP setup (no-op if not launched via torchrun) -----
     rank, world_size, local_rank = setup_ddp()
@@ -638,12 +614,9 @@ def main():
     set_seed(cfg.seed)
     initialize_dns_cache()
 
-    # === STEP G integration (reconstructed) ===
     # Patch AgentSession before any rollout runner is built so the merged-system
     # prefix is in place for both training and eval rollouts.
     patches.apply()
-    # === END STEP G ===
-
     # ----- Load thinkingbox config + data -----
     tb_cfg: ConfigFile = load_yaml(cfg.tb_config, ConfigFile)
     names = load_test_list(cfg.train_list)
@@ -706,7 +679,6 @@ def main():
     init_name = cfg.lora_name_template.format(step=0)
     init_path = Path(cfg.lora_save_dir) / init_name
 
-    # === STEP G integration (reconstructed) ===
     # Resolve --resume into either a fresh start (step 0) or a restored state.
     start_step = 0
     if args.resume:
@@ -735,9 +707,6 @@ def main():
             logger.info("loaded initial adapter into vLLM: %s", init_name)
         current_lora_name = init_name
         ddp_barrier(world_size)
-    # === END STEP G ===
-
-    # === STEP G integration (reconstructed) ===
     # wandb / weave init: rank-0 only. Other ranks get a no-op WandbLogger.
     wandb_log = WandbLogger.maybe_init(
         enabled=args.wandb and is_rank0(rank),
@@ -758,8 +727,6 @@ def main():
             out_path=state_path(cfg.state_save_dir, 0),
         )
     ddp_barrier(world_size)
-    # === END STEP G ===
-
     # ----- Train -----
     if is_rank0(rank) and cfg.log_file:
         Path(cfg.log_file).parent.mkdir(parents=True, exist_ok=True)
@@ -772,7 +739,6 @@ def main():
     )
     try:
         with log_fh_cm as log_fh:
-            # === STEP G integration (reconstructed) ===
             if args.eval_at_start and start_step == 0:
                 if is_rank0(rank):
                     eval_row = run_eval(
@@ -781,14 +747,12 @@ def main():
                     log_eval(eval_row, log_fh)
                     wandb_log.log_eval(start_step, eval_row)
                 ddp_barrier(world_size)
-            # === END STEP G ===
             for step in range(start_step, cfg.max_steps):
                 current_lora_name, train_row = run_one_step(
                     step, cfg, tb_cfg, train_cases, policy, tokenizer, optimizer,
                     lora_client, current_lora_name, log_fh,
                     rank=rank, world_size=world_size,
                 )
-                # === STEP G integration (reconstructed) ===
                 if train_row is not None and is_rank0(rank):
                     wandb_log.log_train(step, train_row)
                 # Periodic eval (rank 0 only; other ranks barrier).
@@ -813,16 +777,11 @@ def main():
                             cfg.lora_name_template, keep=args.keep_checkpoints,
                         )
                     ddp_barrier(world_size)
-                # === END STEP G ===
-
         if is_rank0(rank):
             logger.info("training complete; final adapter: %s", current_lora_name)
     finally:
-        # === STEP G integration (reconstructed) ===
         wandb_log.finish()
-        # === END STEP G ===
         cleanup_ddp(world_size)
-
 
 if __name__ == "__main__":
     main()
