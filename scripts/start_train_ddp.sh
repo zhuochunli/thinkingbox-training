@@ -23,6 +23,7 @@ export CUDA_VISIBLE_DEVICES
 # export NCCL_DEBUG=INFO
 # Avoid HF tokenizer fork warnings under torchrun.
 export TOKENIZERS_PARALLELISM=false
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 
 source .venv/bin/activate
 
