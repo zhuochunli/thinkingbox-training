@@ -7,7 +7,7 @@ orchestrator:
   agent_model:
     # OpenAI-Compatible Chat Completions, DeepSeek style reasoning_content
     type: aoai
-    deployment: "Qwen3.5-9B"  # served model name
+    deployment: "Qwen/Qwen3.5-9B"  # served model name
     endpoint_url: "http://127.0.0.1:8000/v1/chat/completions"
     is_reasoning: true
     temperature: 1.0
@@ -19,7 +19,7 @@ judge_model:
   credential:
     type: az-cli
   account_name: "aoai-l-eastus2"
-  deployment: "gpt-5.4-mini"
+  deployment: "gpt-5.4-mini-no-filter"
   temperature: 0.0
   seed: 42
   max_completion_tokens: 128
@@ -33,7 +33,7 @@ user_model:
   credential:
     type: az-cli
   account_name: "aoai-l-eastus2"
-  deployment: "gpt-5.4-mini"
+  deployment: "gpt-5.4-mini-no-filter"
   temperature: 0.3
   max_completion_tokens: 4096
   api_version: "2025-04-01-preview"

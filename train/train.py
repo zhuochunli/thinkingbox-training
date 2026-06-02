@@ -30,7 +30,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from contextlib import nullcontext
 from peft import get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -70,14 +72,50 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# DDP helpers (no-op when launched without torchrun)
+# ---------------------------------------------------------------------------
+def setup_ddp() -> tuple[int, int, int]:
+    """Init NCCL process group from torchrun env. Returns (rank, world_size, local_rank)."""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        if world_size > 1 and not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        return rank, world_size, local_rank
+    return 0, 1, 0
+
+
+def cleanup_ddp(world_size: int) -> None:
+    if world_size > 1 and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_rank0(rank: int) -> bool:
+    return rank == 0
+
+
+def ddp_barrier(world_size: int) -> None:
+    if world_size > 1 and dist.is_initialized():
+        dist.barrier()
+
+
+def peft_of(policy):
+    """Return the underlying PeftModel whether or not `policy` is a DDP wrapper."""
+    return policy.module if isinstance(policy, torch.nn.parallel.DistributedDataParallel) else policy
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 @dataclass
 class TrainConfig:
     # Model
     model_name: str = "Qwen/Qwen3.5-9B"
-    lora_rank: int = 64
-    lora_alpha: int = 64
+    lora_rank: int = 16
+    lora_alpha: int = 32
     lora_dropout: float = 0.0
     device: str = "cuda:0"
     dtype: str = "bfloat16"
@@ -95,7 +133,7 @@ class TrainConfig:
 
     # Training
     max_steps: int = 2
-    lr: float = 1e-5
+    lr: float = 1e-6
     weight_decay: float = 0.0
     grad_clip: float = 1.0
     ppo_epochs: int = 1
@@ -184,7 +222,12 @@ def compute_logprobs(
     batch: Batch,
     micro_batch_size: int,
 ) -> torch.Tensor:
-    """Returns [B, T-1] gather log π(target | prefix) under `model`'s current state."""
+    """Returns [B, T-1] gather log π(target | prefix) under `model`'s current state.
+
+    Pass the underlying PeftModel (not the DDP wrapper) since this is a no-grad
+    forward and the DDP forward hook would only add overhead.
+    """
+    model = peft_of(model)
     B, T = batch.input_ids.shape
     out = torch.empty((B, T - 1), dtype=torch.float32, device=batch.input_ids.device)
     for s in range(0, B, micro_batch_size):
@@ -224,7 +267,11 @@ def policy_forward_with_grad(
                 "num_tokens": 0.0}
     diag_w = 0.0
 
-    for s in range(0, B, micro_batch_size):
+    is_ddp = isinstance(model, torch.nn.parallel.DistributedDataParallel)
+    micro_starts = list(range(0, B, micro_batch_size))
+    last_idx = len(micro_starts) - 1
+
+    for i, s in enumerate(micro_starts):
         e = min(s + micro_batch_size, B)
         ids = batch.input_ids[s:e]
         attn = batch.attention_mask[s:e]
@@ -246,7 +293,10 @@ def policy_forward_with_grad(
         # Re-weight so the effective batch-level loss == token_mean over full batch
         sub_tokens = amask[:, 1:].sum().clamp_min(1).item()
         w = sub_tokens / total_tokens
-        (out["loss"] * w).backward()
+        # Skip DDP grad sync on all but the last micro-batch (one all-reduce per step).
+        sync_ctx = model.no_sync() if (is_ddp and i < last_idx) else nullcontext()
+        with sync_ctx:
+            (out["loss"] * w).backward()
         for k, v in out.items():
             if torch.is_tensor(v):
                 diag_sum[k] += float(v.detach()) * w
@@ -283,16 +333,28 @@ def run_one_step(
     lora_client: VLLMLoraClient,
     current_lora_name: str,
     log_fh,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> tuple[str, dict | None]:
     device = torch.device(cfg.device)
     t_step = time.monotonic()
 
-    # ----- Sample prompts -----
+    # ----- Sample prompts (deterministic across ranks: separate RNG seeded by step) -----
     by_name = {tc.uid: tc for tc in train_cases}
-    pick = random.sample(list(by_name), cfg.n_prompts_per_step)
-    batch_tcs = [by_name[n] for n in pick]
+    rng = random.Random(cfg.seed * 1_000_003 + step)
+    pick = rng.sample(sorted(by_name), cfg.n_prompts_per_step)
+    # Shard prompts across ranks. Each rank rolls out FULL G samples for its
+    # subset, so per-prompt groups stay complete on one rank → local
+    # compute_advantages == global group-norm advantage.
+    if cfg.n_prompts_per_step % world_size != 0:
+        raise ValueError(
+            f"--n-prompts ({cfg.n_prompts_per_step}) must be divisible by "
+            f"world_size ({world_size}) for prompt-level DDP sharding."
+        )
+    local_pick = pick[rank::world_size]
+    batch_tcs = [by_name[n] for n in local_pick]
 
-    # ----- Rollout -----
+    # ----- Rollout (this rank's slice only) -----
     runner = build_runner(tb_cfg, current_lora_name, cfg.rollout_concurrency)
     t0 = time.monotonic()
     rollouts_by_uid = asyncio.run(
@@ -356,7 +418,7 @@ def run_one_step(
     t0 = time.monotonic()
     policy.eval()
     old_logp = compute_logprobs(policy, batch, cfg.micro_batch_size)
-    with policy.disable_adapter():
+    with peft_of(policy).disable_adapter():
         ref_logp = compute_logprobs(policy, batch, cfg.micro_batch_size)
     t_logp = time.monotonic() - t0
 
@@ -375,10 +437,15 @@ def run_one_step(
         optimizer.step()
     t_update = time.monotonic() - t0
 
-    # ----- Hot-swap LoRA into vLLM -----
+    # ----- Hot-swap LoRA into vLLM (rank 0 only; other ranks barrier below) -----
     next_name = cfg.lora_name_template.format(step=step + 1)
     next_path = Path(cfg.lora_save_dir) / next_name
-    lora_client.hot_swap(policy, next_path, lora_name=next_name, prev_lora_name=current_lora_name)
+    if is_rank0(rank):
+        lora_client.hot_swap(
+            peft_of(policy), next_path,
+            lora_name=next_name, prev_lora_name=current_lora_name,
+        )
+    ddp_barrier(world_size)
 
     # ----- Log -----
     reward_arr = torch.tensor(rewards, dtype=torch.float32)
@@ -411,9 +478,11 @@ def run_one_step(
         f"clip={log_row['clip_frac']:.2f}  rollout={log_row['t_rollout_s']}s  "
         f"update={log_row['t_update_s']}s  total={log_row['t_step_s']}s"
     )
-    logger.info(msg)
-    log_fh.write(json.dumps(log_row) + "\n")
-    log_fh.flush()
+    if is_rank0(rank):
+        logger.info(msg)
+        if log_fh is not None:
+            log_fh.write(json.dumps(log_row) + "\n")
+            log_fh.flush()
 
     return next_name, log_row
 
@@ -425,7 +494,7 @@ def main():
         "--dataset",
         default=os.environ.get(
             "THINKINGBOX_DATA",
-            "/home/azureuser/zhuochun/thinkingbox-data",
+            "/home/azureuser/zhuochun_microsoft/AI.ThinkingBox.Data",
         )
         + "/dataset",
     )
@@ -436,13 +505,18 @@ def main():
     ap.add_argument("--g", type=int, default=4)
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--micro-batch", type=int, default=1)
-    ap.add_argument("--lr", type=float, default=1e-5)
+    ap.add_argument("--lr", type=float, default=1e-6)
+    ap.add_argument("--lora-rank", type=int, default=16)
+    ap.add_argument("--lora-alpha", type=int, default=32)
+    ap.add_argument("--lora-dropout", type=float, default=0.0)
     ap.add_argument("--ppo-epochs", type=int, default=1)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--algo", choices=["grpo", "dr_grpo", "dapo"], default="dr_grpo")
     ap.add_argument("--lora-save-dir", default="checkpoints/lora")
     ap.add_argument("--log-file", default="checkpoints/train_log.jsonl")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--ddp-find-unused-parameters", action="store_true",
+                    help="Pass find_unused_parameters=True to DDP (slower; use only if needed).")
     # === STEP G integration (reconstructed) ===
     ap.add_argument("--max-seq-len", type=int, default=16384,
                     help="Truncate left if a rollout exceeds this token count.")
@@ -490,6 +564,9 @@ def main():
         dataset_dir=args.dataset,
         train_list=args.train_list,
         agent=args.agent,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
         n_prompts_per_step=args.n_prompts,
         n_samples_per_prompt=args.g,
         rollout_concurrency=args.concurrency,
@@ -508,6 +585,13 @@ def main():
         state_save_dir=args.state_save_dir,
         # === END STEP G ===
     )
+    # ----- DDP setup (no-op if not launched via torchrun) -----
+    rank, world_size, local_rank = setup_ddp()
+    if torch.cuda.is_available():
+        cfg.device = f"cuda:{local_rank}"
+    else:
+        cfg.device = "cpu"
+
     set_seed(cfg.seed)
     initialize_dns_cache()
 
@@ -521,17 +605,20 @@ def main():
     tb_cfg: ConfigFile = load_yaml(cfg.tb_config, ConfigFile)
     names = load_test_list(cfg.train_list)
     train_names, eval_names = split_train_eval(names)
-    logger.info("train=%d  eval=%d  algo=%s", len(train_names), len(eval_names), args.algo)
+    if is_rank0(rank):
+        logger.info("rank=%d/%d  device=%s  train=%d  eval=%d  algo=%s",
+                    rank, world_size, cfg.device, len(train_names), len(eval_names), args.algo)
     train_cases = hydrate(train_names, cfg.dataset_dir, cfg.agent)
-    logger.info("hydrated %d train cases", len(train_cases))
-    # === STEP G integration (reconstructed) ===
+    if is_rank0(rank):
+        logger.info("hydrated %d train cases", len(train_cases))
     eval_cases = hydrate(eval_names, cfg.dataset_dir, cfg.agent)
-    logger.info("hydrated %d eval cases", len(eval_cases))
-    # === END STEP G ===
+    if is_rank0(rank):
+        logger.info("hydrated %d eval cases", len(eval_cases))
 
     # ----- Load model + LoRA -----
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[cfg.dtype]
-    logger.info("loading %s in %s on %s ...", cfg.model_name, cfg.dtype, cfg.device)
+    if is_rank0(rank):
+        logger.info("loading %s in %s on %s ...", cfg.model_name, cfg.dtype, cfg.device)
     t0 = time.monotonic()
     base = AutoModelForCausalLM.from_pretrained(
         cfg.model_name, torch_dtype=dtype, trust_remote_code=True,
@@ -540,10 +627,28 @@ def main():
     if cfg.gradient_checkpointing:
         base.gradient_checkpointing_enable()
         base.config.use_cache = False
-    policy = get_peft_model(base, make_lora_config(cfg.lora_rank, cfg.lora_alpha, cfg.lora_dropout))
-    logger.info("model loaded in %.1fs; trainable params: %s",
-                time.monotonic() - t0,
-                sum(p.numel() for p in policy.parameters() if p.requires_grad))
+        # Required when only LoRA params are trainable: keeps embedding output's
+        # requires_grad=True so autograd can backprop through the checkpointed graph.
+        base.enable_input_require_grads()
+    peft_model = get_peft_model(base, make_lora_config(cfg.lora_rank, cfg.lora_alpha, cfg.lora_dropout))
+    if is_rank0(rank):
+        logger.info("model loaded in %.1fs; trainable params: %s",
+                    time.monotonic() - t0,
+                    sum(p.numel() for p in peft_model.parameters() if p.requires_grad))
+
+    # Wrap with DDP. With LoRA-only training every trainable param is touched
+    # by every micro-batch, so find_unused_parameters=False is correct and faster.
+    if world_size > 1:
+        policy = torch.nn.parallel.DistributedDataParallel(
+            peft_model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=args.ddp_find_unused_parameters,
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
+        )
+    else:
+        policy = peft_model
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
 
@@ -564,9 +669,9 @@ def main():
     if args.resume:
         resume_file = resolve_resume_path(args.resume, cfg.state_save_dir)
         payload = load_train_state(
-            resume_file, optimizer, policy,
+            resume_file, optimizer, peft_of(policy),
             cfg.lora_save_dir, cfg.lora_name_template,
-            world_size=1,
+            world_size=world_size,
             map_location=cfg.device,
         )
         start_step = payload["step"] + 1
@@ -574,84 +679,104 @@ def main():
         resume_adapter_dir = lora_path_for(
             cfg.lora_save_dir, cfg.lora_name_template, payload["step"]
         )
-        lora_client.load_adapter(current_lora_name, str(resume_adapter_dir))
-        logger.info(
-            "resumed from %s; next step=%d  lora=%s",
-            resume_file, start_step, current_lora_name,
-        )
+        if is_rank0(rank):
+            lora_client.load_adapter(current_lora_name, str(resume_adapter_dir))
+            logger.info(
+                "resumed from %s; next step=%d  lora=%s",
+                resume_file, start_step, current_lora_name,
+            )
+        ddp_barrier(world_size)
     else:
-        lora_client.hot_swap(policy, init_path, lora_name=init_name)
+        if is_rank0(rank):
+            lora_client.hot_swap(peft_of(policy), init_path, lora_name=init_name)
+            logger.info("loaded initial adapter into vLLM: %s", init_name)
         current_lora_name = init_name
-        logger.info("loaded initial adapter into vLLM: %s", current_lora_name)
+        ddp_barrier(world_size)
     # === END STEP G ===
 
     # === STEP G integration (reconstructed) ===
-    # wandb / weave init (rank-0 only in DDP; this snapshot is single-GPU).
+    # wandb / weave init: rank-0 only. Other ranks get a no-op WandbLogger.
     wandb_log = WandbLogger.maybe_init(
-        enabled=args.wandb,
+        enabled=args.wandb and is_rank0(rank),
         project=args.wandb_project,
         entity=args.wandb_entity,
         run_name=args.wandb_run_name,
         run_id=None,  # TODO[recover]: persist+restore wandb run_id via checkpoint payload
-        weave_enabled=args.weave,
+        weave_enabled=args.weave and is_rank0(rank),
         config={**dataclasses.asdict(cfg), "algo": args.algo,
-                "world_size": 1,
+                "world_size": world_size,
                 "resumed": args.resume is not None},
     )
-    # Persist a step-0 anchor checkpoint so --resume latest always works.
-    if not args.resume and args.save_every > 0:
+    # Persist a step-0 anchor checkpoint so --resume latest always works (rank 0).
+    if not args.resume and args.save_every > 0 and is_rank0(rank):
         save_train_state(
             step=0, optimizer=optimizer, lora_name=init_name,
-            world_size=1,
+            world_size=world_size,
             out_path=state_path(cfg.state_save_dir, 0),
         )
+    ddp_barrier(world_size)
     # === END STEP G ===
 
     # ----- Train -----
-    Path(cfg.log_file).parent.mkdir(parents=True, exist_ok=True)
+    if is_rank0(rank):
+        Path(cfg.log_file).parent.mkdir(parents=True, exist_ok=True)
+    ddp_barrier(world_size)
+
+    log_fh_cm = (
+        open(cfg.log_file, "a", encoding="utf-8") if is_rank0(rank) else nullcontext()
+    )
     try:
-        with open(cfg.log_file, "a", encoding="utf-8") as log_fh:
+        with log_fh_cm as log_fh:
             # === STEP G integration (reconstructed) ===
             if args.eval_at_start and start_step == 0:
-                eval_row = run_eval(
-                    start_step, tb_cfg, eval_cases, current_lora_name, cfg.reward_fn,
-                )
-                log_eval(eval_row, log_fh)
-                wandb_log.log_eval(start_step, eval_row)
+                if is_rank0(rank):
+                    eval_row = run_eval(
+                        start_step, tb_cfg, eval_cases, current_lora_name, cfg.reward_fn,
+                    )
+                    log_eval(eval_row, log_fh)
+                    wandb_log.log_eval(start_step, eval_row)
+                ddp_barrier(world_size)
             # === END STEP G ===
             for step in range(start_step, cfg.max_steps):
                 current_lora_name, train_row = run_one_step(
                     step, cfg, tb_cfg, train_cases, policy, tokenizer, optimizer,
                     lora_client, current_lora_name, log_fh,
+                    rank=rank, world_size=world_size,
                 )
                 # === STEP G integration (reconstructed) ===
-                if train_row is not None:
+                if train_row is not None and is_rank0(rank):
                     wandb_log.log_train(step, train_row)
-                # Periodic eval.
+                # Periodic eval (rank 0 only; other ranks barrier).
                 if args.eval_every > 0 and ((step + 1) % args.eval_every == 0):
-                    eval_row = run_eval(
-                        step + 1, tb_cfg, eval_cases, current_lora_name, cfg.reward_fn,
-                    )
-                    log_eval(eval_row, log_fh)
-                    wandb_log.log_eval(step + 1, eval_row)
-                # Periodic state checkpoint + prune.
+                    if is_rank0(rank):
+                        eval_row = run_eval(
+                            step + 1, tb_cfg, eval_cases, current_lora_name, cfg.reward_fn,
+                        )
+                        log_eval(eval_row, log_fh)
+                        wandb_log.log_eval(step + 1, eval_row)
+                    ddp_barrier(world_size)
+                # Periodic state checkpoint + prune (rank 0 only).
                 if args.save_every > 0 and ((step + 1) % args.save_every == 0):
-                    save_train_state(
-                        step=step + 1, optimizer=optimizer,
-                        lora_name=current_lora_name, world_size=1,
-                        out_path=state_path(cfg.state_save_dir, step + 1),
-                    )
-                    prune_old_state(
-                        cfg.state_save_dir, cfg.lora_save_dir,
-                        cfg.lora_name_template, keep=args.keep_checkpoints,
-                    )
+                    if is_rank0(rank):
+                        save_train_state(
+                            step=step + 1, optimizer=optimizer,
+                            lora_name=current_lora_name, world_size=world_size,
+                            out_path=state_path(cfg.state_save_dir, step + 1),
+                        )
+                        prune_old_state(
+                            cfg.state_save_dir, cfg.lora_save_dir,
+                            cfg.lora_name_template, keep=args.keep_checkpoints,
+                        )
+                    ddp_barrier(world_size)
                 # === END STEP G ===
 
-        logger.info("training complete; final adapter: %s", current_lora_name)
+        if is_rank0(rank):
+            logger.info("training complete; final adapter: %s", current_lora_name)
     finally:
         # === STEP G integration (reconstructed) ===
         wandb_log.finish()
         # === END STEP G ===
+        cleanup_ddp(world_size)
 
 
 if __name__ == "__main__":
