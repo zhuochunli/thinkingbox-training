@@ -282,7 +282,10 @@ def policy_forward_with_grad(
             ids = batch.input_ids[s:e]
             attn = batch.attention_mask[s:e]
             amask = batch.assistant_mask[s:e]
-            logits = model(input_ids=ids, attention_mask=attn, use_cache=False).logits.float()
+            # Keep logits in native bf16; gather_token_logprobs/token_entropy
+            # upcast each T-chunk internally. An upfront `.float()` over
+            # [B, T, V] would peak at ~20 GiB at T=16k / V=152k and OOM.
+            logits = model(input_ids=ids, attention_mask=attn, use_cache=False).logits
             out = compute_rl_loss(
                 logits=logits,
                 input_ids=ids,
@@ -305,7 +308,7 @@ def policy_forward_with_grad(
             ids = batch.input_ids[s:e]
             attn = batch.attention_mask[s:e]
             amask = batch.assistant_mask[s:e]
-            logits = model(input_ids=ids, attention_mask=attn, use_cache=False).logits.float()
+            logits = model(input_ids=ids, attention_mask=attn, use_cache=False).logits
             loss = logits.sum() * 0.0
             out = None
             w = 0.0

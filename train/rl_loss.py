@@ -90,21 +90,46 @@ def compute_advantages(rewards: torch.Tensor, group_ids: torch.Tensor, cfg: RLLo
 # ---------------------------------------------------------------------------
 # Per-token logprobs / entropy
 # ---------------------------------------------------------------------------
-def gather_token_logprobs(logits: torch.Tensor, target_ids: torch.Tensor) -> torch.Tensor:
-    """logits: [B, T, V]; target_ids: [B, T] → logprobs of target token at each pos.
+def gather_token_logprobs(
+    logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    chunk_size: int = 1024,
+) -> torch.Tensor:
+    """logits: [B, T, V]; target_ids: [B, T] -> logprobs of target token at each pos.
 
     Caller is responsible for the next-token shift (i.e. pass logits[:, :-1]
     and ids[:, 1:]).
+
+    Memory-efficient: computes `gather(logits) - logsumexp(logits)` chunked
+    over T, so we never allocate a `[B, T, V]` softmax tensor (would be ~20 GiB
+    at T=32k, V=152k, fp32). Peak extra memory per chunk is O(B*chunk_size*V).
+    Always returns fp32.
     """
-    logp = F.log_softmax(logits, dim=-1)
-    return logp.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+    B, T, _ = logits.shape
+    out = torch.empty((B, T), dtype=torch.float32, device=logits.device)
+    for s in range(0, T, chunk_size):
+        e = min(s + chunk_size, T)
+        chunk = logits[:, s:e, :].float()
+        tgt = target_ids[:, s:e].unsqueeze(-1)
+        gathered = chunk.gather(-1, tgt).squeeze(-1)
+        lse = torch.logsumexp(chunk, dim=-1)
+        out[:, s:e] = gathered - lse
+    return out
 
 
-def token_entropy(logits: torch.Tensor) -> torch.Tensor:
-    """Categorical entropy per position. logits: [B, T, V] → [B, T]."""
-    logp = F.log_softmax(logits, dim=-1)
-    p = logp.exp()
-    return -(p * logp).sum(dim=-1)
+def token_entropy(logits: torch.Tensor, chunk_size: int = 1024) -> torch.Tensor:
+    """Categorical entropy per position. logits: [B, T, V] → [B, T].
+
+    Chunked over T so we never materialize `[B, T, V]` softmax in fp32.
+    """
+    B, T, _ = logits.shape
+    out = torch.empty((B, T), dtype=torch.float32, device=logits.device)
+    for s in range(0, T, chunk_size):
+        e = min(s + chunk_size, T)
+        chunk = logits[:, s:e, :].float()
+        logp = F.log_softmax(chunk, dim=-1)
+        out[:, s:e] = -(logp.exp() * logp).sum(dim=-1)
+    return out
 
 
 # ---------------------------------------------------------------------------
