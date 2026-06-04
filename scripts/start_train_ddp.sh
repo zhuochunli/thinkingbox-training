@@ -25,6 +25,20 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 
 source .venv/bin/activate
 
+# Pre-create the run dir so a `tee` pipeline (which opens its file before the
+# trainer runs) doesn't race against the trainer's own mkdir. Only acts when
+# --tag X is present in the args.
+for ((i=1; i<=$#; i++)); do
+  arg="${!i}"
+  case "$arg" in
+    --tag)   j=$((i+1)); _tag="${!j:-}"; ;;
+    --tag=*) _tag="${arg#--tag=}" ;;
+  esac
+done
+if [[ -n "${_tag:-}" ]]; then
+  mkdir -p "checkpoints/${_tag}/lora" "checkpoints/${_tag}/state" "checkpoints/${_tag}/logs"
+fi
+
 PYTHONPATH=. exec torchrun \
     --standalone \
     --nproc_per_node="${NPROC_PER_NODE}" \
