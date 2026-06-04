@@ -27,6 +27,42 @@ def load_test_list(path: str | Path) -> list[str]:
     return [str(x) for x in data]
 
 
+def resolve_eval_size(spec: str | int | None, pool_size: int) -> int:
+    """Resolve an --eval-split spec into a concrete eval-set count.
+
+    Accepted forms:
+      - None            -> DEFAULT_EVAL_SIZE (clamped to pool_size)
+      - int / "5"       -> that many cases
+      - "0.2"           -> fraction of pool_size (rounded), i.e. 20%
+      - "8:2"           -> train:eval ratio; eval = round(pool * 2/(8+2))
+    The result is clamped to [1, pool_size-1] when pool_size >= 2 so that both
+    splits are non-empty; for pool_size == 1 it returns 0.
+    """
+    if pool_size <= 1:
+        return 0
+    if spec is None:
+        n = DEFAULT_EVAL_SIZE
+    else:
+        s = str(spec).strip()
+        if ":" in s:
+            a, b = s.split(":", 1)
+            tr, ev = float(a), float(b)
+            if tr < 0 or ev < 0 or (tr + ev) == 0:
+                raise ValueError(f"invalid ratio --eval-split={spec!r}")
+            n = round(pool_size * ev / (tr + ev))
+        elif "." in s:
+            frac = float(s)
+            if not (0.0 < frac < 1.0):
+                raise ValueError(f"fractional --eval-split must be in (0,1): {spec!r}")
+            n = round(pool_size * frac)
+        else:
+            n = int(s)
+    if n < 0:
+        raise ValueError(f"--eval-split resolved to negative count: {spec!r}")
+    # keep both splits non-empty
+    return max(1, min(n, pool_size - 1))
+
+
 def split_train_eval(
     names: Iterable[str],
     eval_size: int = DEFAULT_EVAL_SIZE,

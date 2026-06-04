@@ -41,7 +41,7 @@ from thinkingbox.cli.common import load_yaml
 from thinkingbox.common.config_types import ConfigFile
 from thinkingbox.common.http_client import initialize_dns_cache
 
-from train.data_pipeline import hydrate, load_test_list, split_train_eval
+from train.data_pipeline import hydrate, load_test_list, resolve_eval_size, split_train_eval
 from train.lora_sync import VLLMLoraClient, make_lora_config
 from train.rewards import score_rollouts
 from train.rl_loss import (
@@ -618,7 +618,7 @@ def main():
     ap.add_argument("--lora-save-dir", default=None)
     ap.add_argument("--log-file", default=None,
                     help="optional path to a per-step metrics JSONL; if omitted, no JSONL is written")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=731)
     ap.add_argument("--ddp-find-unused-parameters", action="store_true",
                     help="Pass find_unused_parameters=True to DDP (slower; use only if needed).")
     ap.add_argument("--max-seq-len", type=int, default=16384,
@@ -630,6 +630,10 @@ def main():
                     help="Run eval every N training steps (0 disables periodic eval).")
     ap.add_argument("--eval-at-start", action="store_true",
                     help="Run an eval pass before the first training step.")
+    ap.add_argument("--eval-split", default=None,
+                    help="Size of the held-out eval set carved from --train-list. "
+                         "Accepts a count (e.g. 5, 10), a fraction (e.g. 0.2 = 20%%), "
+                         "or a train:eval ratio (e.g. 8:2). Default: 5 cases.")
     ap.add_argument("--save-every", type=int, default=0,
                     help="Save train state every N steps (0 disables).")
     ap.add_argument("--keep-checkpoints", type=int, default=4,
@@ -734,7 +738,8 @@ def main():
     # ----- Load thinkingbox config + data -----
     tb_cfg: ConfigFile = load_yaml(cfg.tb_config, ConfigFile)
     names = load_test_list(cfg.train_list)
-    train_names, eval_names = split_train_eval(names)
+    eval_size = resolve_eval_size(args.eval_split, len({*names}))
+    train_names, eval_names = split_train_eval(names, eval_size=eval_size)
     if is_rank0(rank):
         logger.info("rank=%d/%d  device=%s  train=%d  eval=%d  algo=%s",
                     rank, world_size, cfg.device, len(train_names), len(eval_names), args.algo)
