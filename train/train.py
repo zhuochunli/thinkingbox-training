@@ -634,6 +634,10 @@ def main():
                     help="Save train state every N steps (0 disables).")
     ap.add_argument("--keep-checkpoints", type=int, default=4,
                     help="Keep only the latest N state checkpoints (step 0 is always kept).")
+    ap.add_argument("--keep-loras", action="store_true",
+                    help="Keep every per-step LoRA dir on disk. Default behavior "
+                         "prunes any LoRA that isn't a --save-every anchor (and "
+                         "step 0 is always kept).")
     ap.add_argument("--state-save-dir", default="checkpoints/state")
     ap.add_argument("--resume", default=None,
                     help="Path to a state_step_*.pt file, or 'latest'.")
@@ -838,6 +842,7 @@ def main():
                     wandb_log.log_eval(start_step, eval_row)
                 ddp_barrier(world_size)
             for step in range(start_step, cfg.max_steps):
+                prev_lora_name = current_lora_name
                 current_lora_name, train_row = run_one_step(
                     step, cfg, tb_cfg, train_cases, policy, tokenizer, optimizer,
                     lora_client, current_lora_name, log_fh,
@@ -845,6 +850,20 @@ def main():
                 )
                 if train_row is not None and is_rank0(rank):
                     wandb_log.log_train(step, train_row)
+                # Prune the just-unloaded LoRA dir if it isn't a save_every anchor.
+                # Step 0 is always kept (baseline reference); anchors are needed for
+                # `--resume`. Everything in between is dead weight on disk.
+                if (not args.keep_loras) and is_rank0(rank) and prev_lora_name != current_lora_name:
+                    import re as _re, shutil as _shutil
+                    m = _re.match(r"policy_step_(\d{5})$", prev_lora_name)
+                    if m:
+                        prev_step = int(m.group(1))
+                        is_anchor = (args.save_every > 0 and prev_step % args.save_every == 0)
+                        if prev_step != 0 and not is_anchor:
+                            prev_dir = Path(cfg.lora_save_dir) / prev_lora_name
+                            if prev_dir.exists():
+                                _shutil.rmtree(prev_dir, ignore_errors=True)
+                                logger.info("pruned intermediate LoRA %s", prev_lora_name)
                 # Periodic eval (rank 0 only; other ranks barrier).
                 if args.eval_every > 0 and ((step + 1) % args.eval_every == 0):
                     if is_rank0(rank):
