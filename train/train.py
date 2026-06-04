@@ -615,7 +615,7 @@ def main():
     ap.add_argument("--ppo-epochs", type=int, default=1)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--algo", choices=["grpo", "dr_grpo", "dapo"], default="dr_grpo")
-    ap.add_argument("--lora-save-dir", default="checkpoints/lora")
+    ap.add_argument("--lora-save-dir", default=None)
     ap.add_argument("--log-file", default=None,
                     help="optional path to a per-step metrics JSONL; if omitted, no JSONL is written")
     ap.add_argument("--seed", type=int, default=0)
@@ -638,7 +638,12 @@ def main():
                     help="Keep every per-step LoRA dir on disk. Default behavior "
                          "prunes any LoRA that isn't a --save-every anchor (and "
                          "step 0 is always kept).")
-    ap.add_argument("--state-save-dir", default="checkpoints/state")
+    ap.add_argument("--state-save-dir", default=None)
+    ap.add_argument("--tag", default=None,
+                    help="Run tag. When set (and --lora-save-dir / --state-save-dir / "
+                         "--log-file are not explicitly provided), all artifacts are written "
+                         "under checkpoints/<tag>/{lora,state,logs}. Also used as the wandb "
+                         "run name if --wandb-run-name is not given.")
     ap.add_argument("--resume", default=None,
                     help="Path to a state_step_*.pt file, or 'latest'.")
     ap.add_argument("--wandb", action="store_true",
@@ -649,6 +654,21 @@ def main():
     ap.add_argument("--weave", action="store_true",
                     help="Enable weave tracing (uses --wandb-project / --wandb-entity).")
     args = ap.parse_args()
+
+    if args.tag:
+        tag_root = Path("checkpoints") / args.tag
+        if args.lora_save_dir is None:
+            args.lora_save_dir = str(tag_root / "lora")
+        if args.state_save_dir is None:
+            args.state_save_dir = str(tag_root / "state")
+        if args.log_file is None:
+            args.log_file = str(tag_root / "logs" / "train.jsonl")
+        if args.wandb_run_name is None:
+            args.wandb_run_name = args.tag
+    if args.lora_save_dir is None:
+        args.lora_save_dir = "checkpoints/lora"
+    if args.state_save_dir is None:
+        args.state_save_dir = "checkpoints/state"
 
     logging.basicConfig(
         level=logging.INFO,
