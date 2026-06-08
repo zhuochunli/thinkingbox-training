@@ -14,7 +14,7 @@ astor==0.8.1
 attrs==26.1.0
 authlib==1.7.2
 azure-batch==6.0.0
-azure-cli==2.0.67
+azure-cli==2.40.0
 azure-cli-acr==2.2.9
 azure-cli-acs==2.4.4
 azure-cli-advisor==2.0.1
